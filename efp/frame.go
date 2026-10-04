@@ -23,6 +23,7 @@ const (
 	MaxPayload   = 1024
 	MaxFrameLen  = HeaderLen + MaxPayload + CRCLen
 	FlagFragment = 1 << 0 // frame is one fragment of a multi-fragment message
+	FlagControl  = 1 << 1 // frame is a session-layer control frame (e.g. hello)
 )
 
 // ErrKind classifies frame decoding failures so callers can distinguish them.
@@ -81,6 +82,16 @@ var (
 	ErrReassemblyOverflow = errors.New("efp: reassembly resource limit exceeded")
 	ErrReassemblyTimeout  = errors.New("efp: reassembly timed out")
 	ErrSessionClosed      = errors.New("efp: session closed")
+
+	// ErrDuplicateFragment classifies informational duplicate-fragment
+	// events. It is never a failure: the fragment is ignored and the
+	// message is still delivered exactly once.
+	ErrDuplicateFragment = errors.New("efp: duplicate fragment")
+
+	// ErrExceedsPeerLimit is returned by SendMessage when the payload is
+	// larger than the receive limit the peer advertised (or the default
+	// limit, if the peer does not negotiate). The message is NOT sent.
+	ErrExceedsPeerLimit = errors.New("efp: message exceeds peer's receive limit")
 )
 
 // Frame is one decoded protocol frame.

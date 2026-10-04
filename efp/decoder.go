@@ -19,6 +19,15 @@ type Decoder struct {
 // NewDecoder creates an empty stream decoder.
 func NewDecoder() *Decoder { return &Decoder{} }
 
+// Reset discards all buffered undecoded bytes. Counters are kept.
+//
+// A transport switch (reconnect) MUST Reset the decoder: bytes buffered
+// from a dead connection are a partial frame at best, and completing them
+// with bytes from the new connection would fabricate a frame that looks
+// well-formed but is garbage. Message-level reassembly state is a separate
+// layer and is intentionally NOT reset (see Session.Attach).
+func (d *Decoder) Reset() { d.buf = d.buf[:0] }
+
 // Feed appends data to the internal buffer and decodes as many complete
 // frames as possible. Corrupt bytes are skipped (resync) and reported via
 // the returned errors; undecodable trailing bytes (half packets) are kept

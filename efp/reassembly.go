@@ -27,6 +27,23 @@ type ReassembledMessage struct {
 	Data  []byte
 }
 
+// DuplicateFragmentEvent is an informational event emitted (on
+// Session.Events) when a fragment arrives that was already received.
+// The duplicate is counted and ignored; the message is still delivered
+// exactly once. It satisfies error so it can flow through error channels,
+// and unwraps to ErrDuplicateFragment for errors.Is checks.
+type DuplicateFragmentEvent struct {
+	MsgID   uint32
+	FragIdx uint16
+}
+
+func (e *DuplicateFragmentEvent) Error() string {
+	return fmt.Sprintf("efp: duplicate fragment %d of message %d (ignored)", e.FragIdx, e.MsgID)
+}
+
+// Unwrap exposes ErrDuplicateFragment for errors.Is checks.
+func (e *DuplicateFragmentEvent) Unwrap() error { return ErrDuplicateFragment }
+
 // ReassemblyError describes a deterministic reassembly failure
 // (timeout, overflow, inconsistent fragments).
 type ReassemblyError struct {
@@ -56,6 +73,16 @@ type Reassembler struct {
 	cfg      ReassemblyConfig
 	now      func() time.Time // injectable clock for deterministic tests
 	inFlight map[uint32]*assembly
+
+	// Runtime counters. Guarded by the same external serialization as the
+	// rest of the struct (Session holds rxMu); read via counters().
+	dupFragments     uint64
+	timeouts         uint64
+	inFlightRejected uint64
+
+	// OnDuplicateFragment, if set, is invoked each time a duplicate
+	// fragment is ignored. Called synchronously from Push.
+	OnDuplicateFragment func(msgID uint32, fragIdx uint16)
 }
 
 // NewReassembler creates a Reassembler with the given config.
@@ -82,6 +109,7 @@ func (r *Reassembler) Push(f *Frame) (msg *ReassembledMessage, err error) {
 	if !ok {
 		// Enforce limits before allocating anything.
 		if len(r.inFlight) >= r.cfg.MaxInFlight {
+			r.inFlightRejected++
 			return nil, &ReassemblyError{MsgID: f.MsgID, Reason: fmt.Errorf(
 				"%w: %d messages already in flight", ErrReassemblyOverflow, len(r.inFlight))}
 		}
@@ -107,6 +135,10 @@ func (r *Reassembler) Push(f *Frame) (msg *ReassembledMessage, err error) {
 
 	// Duplicate fragment: ignore deterministically (counted, not delivered).
 	if a.frags[f.FragIdx] != nil {
+		r.dupFragments++
+		if r.OnDuplicateFragment != nil {
+			r.OnDuplicateFragment(f.MsgID, f.FragIdx)
+		}
 		return nil, nil
 	}
 
@@ -145,6 +177,7 @@ func (r *Reassembler) Expire() []error {
 			errs = append(errs, &ReassemblyError{MsgID: id, Reason: fmt.Errorf(
 				"%w: %d/%d fragments after %s", ErrReassemblyTimeout, a.received, a.fragCnt,
 				r.cfg.FragmentTimeout)})
+			r.timeouts++
 			delete(r.inFlight, id)
 		}
 	}
@@ -153,6 +186,12 @@ func (r *Reassembler) Expire() []error {
 
 // InFlight returns the number of incomplete messages currently buffered.
 func (r *Reassembler) InFlight() int { return len(r.inFlight) }
+
+// counters returns a snapshot of the reassembler's runtime counters.
+// Callers must hold the same serialization as Push/Expire (Session.rxMu).
+func (r *Reassembler) counters() (dupFragments, timeouts, inFlightRejected uint64) {
+	return r.dupFragments, r.timeouts, r.inFlightRejected
+}
 
 // Fragment splits payload into frames for message msgID, assigning sequence
 // numbers starting at seqStart. It returns the frames and the next sequence
