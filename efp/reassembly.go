@@ -50,18 +50,31 @@ type assembly struct {
 	created   time.Time
 }
 
+// reassemblyEventSink receives observability events emitted while pushing
+// fragments. The Session implements it; standalone test users can leave it
+// unset.
+type reassemblyEventSink interface {
+	onDuplicateFragment(msgID uint32, fragIdx uint16)
+	onReassemblyRejected()
+	onFragmentTimeout()
+}
+
 // Reassembler reassembles fragmented messages. It is NOT safe for
 // concurrent use; callers (e.g. Session) must serialize access.
 type Reassembler struct {
 	cfg      ReassemblyConfig
 	now      func() time.Time // injectable clock for deterministic tests
 	inFlight map[uint32]*assembly
+	sink     reassemblyEventSink
 }
 
 // NewReassembler creates a Reassembler with the given config.
 func NewReassembler(cfg ReassemblyConfig) *Reassembler {
 	return &Reassembler{cfg: cfg, now: time.Now, inFlight: make(map[uint32]*assembly)}
 }
+
+// SetEventSink attaches the observability sink (used by Session).
+func (r *Reassembler) SetEventSink(sink reassemblyEventSink) { r.sink = sink }
 
 // SetClock overrides the time source (tests only).
 func (r *Reassembler) SetClock(now func() time.Time) { r.now = now }
@@ -82,10 +95,16 @@ func (r *Reassembler) Push(f *Frame) (msg *ReassembledMessage, err error) {
 	if !ok {
 		// Enforce limits before allocating anything.
 		if len(r.inFlight) >= r.cfg.MaxInFlight {
+			if r.sink != nil {
+				r.sink.onReassemblyRejected()
+			}
 			return nil, &ReassemblyError{MsgID: f.MsgID, Reason: fmt.Errorf(
 				"%w: %d messages already in flight", ErrReassemblyOverflow, len(r.inFlight))}
 		}
 		if int(f.FragCnt)*MaxPayload > r.cfg.MaxMessageSize {
+			if r.sink != nil {
+				r.sink.onReassemblyRejected()
+			}
 			return nil, &ReassemblyError{MsgID: f.MsgID, Reason: fmt.Errorf(
 				"%w: %d fragments could exceed max message size %d",
 				ErrMessageTooLarge, f.FragCnt, r.cfg.MaxMessageSize)}
@@ -105,8 +124,13 @@ func (r *Reassembler) Push(f *Frame) (msg *ReassembledMessage, err error) {
 			"%w: inconsistent FragCnt %d != %d", ErrBadLength, f.FragCnt, a.fragCnt)}
 	}
 
-	// Duplicate fragment: ignore deterministically (counted, not delivered).
+	// Duplicate fragment: it still counts as one fragment and the message
+	// is still delivered at most once; report the occurrence for
+	// observability and ignore the bytes.
 	if a.frags[f.FragIdx] != nil {
+		if r.sink != nil {
+			r.sink.onDuplicateFragment(f.MsgID, f.FragIdx)
+		}
 		return nil, nil
 	}
 
@@ -117,6 +141,9 @@ func (r *Reassembler) Push(f *Frame) (msg *ReassembledMessage, err error) {
 	a.totalSize += len(frag)
 	if a.totalSize > r.cfg.MaxMessageSize {
 		delete(r.inFlight, f.MsgID)
+		if r.sink != nil {
+			r.sink.onReassemblyRejected()
+		}
 		return nil, &ReassemblyError{MsgID: f.MsgID, Reason: fmt.Errorf(
 			"%w: accumulated %d bytes > max %d", ErrReassemblyOverflow, a.totalSize, r.cfg.MaxMessageSize)}
 	}
@@ -142,6 +169,9 @@ func (r *Reassembler) Expire() []error {
 	now := r.now()
 	for id, a := range r.inFlight {
 		if now.Sub(a.created) >= r.cfg.FragmentTimeout {
+			if r.sink != nil {
+				r.sink.onFragmentTimeout()
+			}
 			errs = append(errs, &ReassemblyError{MsgID: id, Reason: fmt.Errorf(
 				"%w: %d/%d fragments after %s", ErrReassemblyTimeout, a.received, a.fragCnt,
 				r.cfg.FragmentTimeout)})

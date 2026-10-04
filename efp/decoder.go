@@ -19,6 +19,16 @@ type Decoder struct {
 // NewDecoder creates an empty stream decoder.
 func NewDecoder() *Decoder { return &Decoder{} }
 
+// Reset discards every buffered byte. It MUST be called by the session when
+// a new transport is attached: bytes left over from a half frame on a dead
+// connection must never be concatenated with bytes of the new connection,
+// otherwise two connections' tail/head could form a plausible-looking but
+// content-corrupt frame. Decoded/error counters are intentionally kept so
+// observability covers the session's whole lifetime.
+func (d *Decoder) Reset() {
+	d.buf = d.buf[:0]
+}
+
 // Feed appends data to the internal buffer and decodes as many complete
 // frames as possible. Corrupt bytes are skipped (resync) and reported via
 // the returned errors; undecodable trailing bytes (half packets) are kept
@@ -51,7 +61,20 @@ func (d *Decoder) Feed(data []byte) (frames []*Frame, errs []error) {
 			}
 		}
 		// Header present: validate version before trusting LEN.
-		if d.buf[2] != Version {
+		// Version 1 = data frames; version 2 is reserved for the
+		// capability control frame (must carry FlagControl).
+		switch d.buf[2] {
+		case Version:
+		case CapVersion:
+			if d.buf[3]&FlagControl == 0 {
+				errs = append(errs, &FrameError{Kind: ErrKindUnsupportedVersion,
+					Detail: fmt.Sprintf("version=%d control frame without control flag", d.buf[2])})
+				d.Errors++
+				d.buf = d.buf[1:]
+				d.BytesDropped++
+				continue
+			}
+		default:
 			errs = append(errs, &FrameError{Kind: ErrKindUnsupportedVersion,
 				Detail: fmt.Sprintf("version=%d supported=%d", d.buf[2], Version)})
 			d.Errors++

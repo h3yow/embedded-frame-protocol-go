@@ -23,6 +23,13 @@ const (
 	MaxPayload   = 1024
 	MaxFrameLen  = HeaderLen + MaxPayload + CRCLen
 	FlagFragment = 1 << 0 // frame is one fragment of a multi-fragment message
+	FlagControl  = 1 << 1 // frame is a connection-control frame (not data)
+
+	// CapVersion marks control frames introduced by the per-connection
+	// capability handshake. Data frames remain at Version 1 so peers running
+	// older firmware can still exchange messages; they reject version-2
+	// frames and resynchronize instead of breaking the connection.
+	CapVersion = 2
 )
 
 // ErrKind classifies frame decoding failures so callers can distinguish them.
@@ -140,7 +147,15 @@ func DecodeFrame(buf []byte) (*Frame, error) {
 		return nil, &FrameError{Kind: ErrKindBadMagic,
 			Detail: fmt.Sprintf("magic=%02x %02x", buf[0], buf[1])}
 	}
-	if buf[2] != Version {
+	switch buf[2] {
+	case Version:
+	case CapVersion:
+		// Version 2 is only used for control frames (capability handshake).
+		if buf[3]&FlagControl == 0 {
+			return nil, &FrameError{Kind: ErrKindUnsupportedVersion,
+				Detail: fmt.Sprintf("version=%d frame without control flag", buf[2])}
+		}
+	default:
 		return nil, &FrameError{Kind: ErrKindUnsupportedVersion,
 			Detail: fmt.Sprintf("version=%d supported=%d", buf[2], Version)}
 	}
