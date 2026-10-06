@@ -9,4 +9,5 @@ type Stats struct {
 	DuplicateFragments uint64 // fragments ignored because already received
 	FragmentTimeouts   uint64 // incomplete messages expired by the janitor
 	InFlightRejected   uint64 // new messages rejected: too many in flight
+	StaleBytesDropped  uint64 // bytes dropped: read from a replaced connection
 }

@@ -17,14 +17,31 @@ import (
 //
 //	KIND(1)=1  MAX_MSG_SIZE(4)  MAX_IN_FLIGHT(2)
 //
-// Compatibility: a peer that never sends a hello (older firmware) is
-// handled by falling back to DefaultPeerCaps(); the connection works, and
-// locally enforced send limits still apply, so oversized messages fail at
-// send time instead of being silently dropped by the receiver.
+// Compatibility with peers that do NOT implement negotiation (older
+// firmware pushes every decoded frame, control flag included, into its
+// reassembler): the hello is deliberately encoded as an UNCOMPLETABLE
+// fragment — FlagFragment set, FragCnt=2, only fragment 0 ever sent,
+// under the reserved MsgID capsReservedMsgID that application messages
+// never use. A legacy peer buffers it as an incomplete message that can
+// never finish, so it is never delivered to the peer's application; it
+// occupies one reassembly slot until the peer's own fragment timeout
+// discards it. A negotiation-aware peer handles the frame by its
+// FlagControl bit before any reassembly and is unaffected.
+//
+// A peer that never sends a hello is handled by falling back to
+// DefaultPeerCaps(); the connection works, and locally enforced send
+// limits still apply, so oversized messages fail at send time instead of
+// being silently dropped by the receiver.
 const (
 	capsKindHello   = 1
 	capsHelloLen    = 7
 	capsMaxInFlight = 1 << 16 // advertised in-flight limit is a uint16
+
+	// capsReservedMsgID is reserved for control traffic; application
+	// messages must never use it. Keeping the hello out of the
+	// application MsgID space prevents its uncompletable fragment from
+	// ever colliding with a real message in a legacy peer's reassembler.
+	capsReservedMsgID = 0xFFFFFFFF
 )
 
 // PeerCaps describes what the peer is willing to receive.
@@ -43,6 +60,11 @@ func DefaultPeerCaps() PeerCaps {
 }
 
 // encodeHello builds the control frame advertising the given local caps.
+// The frame is shaped so that a legacy peer (no control-frame handling)
+// can never reassemble it into a deliverable application message: it
+// carries FlagFragment with FragCnt=2 while only fragment 0 is ever
+// sent, under the reserved MsgID. Negotiation-aware peers dispatch on
+// FlagControl and ignore the fragment fields.
 func encodeHello(seq uint32, caps PeerCaps) (*Frame, error) {
 	if caps.MaxInFlight > capsMaxInFlight {
 		caps.MaxInFlight = capsMaxInFlight
@@ -53,10 +75,11 @@ func encodeHello(seq uint32, caps PeerCaps) (*Frame, error) {
 	binary.BigEndian.PutUint16(p[5:], uint16(caps.MaxInFlight))
 	return &Frame{
 		Version: Version,
-		Flags:   FlagControl,
+		Flags:   FlagControl | FlagFragment,
 		Seq:     seq,
-		MsgID:   0, // control frames carry no application message
-		FragCnt: 1,
+		MsgID:   capsReservedMsgID,
+		FragIdx: 0,
+		FragCnt: 2, // fragment 1 is never sent: uncompletable by design
 		Payload: p,
 	}, nil
 }

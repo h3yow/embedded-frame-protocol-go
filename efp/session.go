@@ -46,6 +46,13 @@ type Session struct {
 	delivered   map[uint32]struct{}
 	delivOrder  []uint32 // FIFO ring of delivered MsgIDs, bounded by dedupWindow
 
+	// rxGen identifies the current receive generation. It is incremented
+	// on every Attach, atomically with the decoder reset (both under
+	// rxMu). Bytes read from a transport of an older generation are
+	// dropped whole in consume, no matter when the read completed.
+	rxGen             uint64
+	staleBytesDropped uint64
+
 	delivCh chan ReassembledMessage
 	errCh   chan error
 	eventCh chan DuplicateFragmentEvent
@@ -91,16 +98,30 @@ func NewSession(cfg SessionConfig) *Session {
 // the read loop. Any previous transport is closed. Unfinished incoming
 // messages are kept; replayed duplicates are dropped by MsgID dedup.
 //
-// Receive boundary rule: the stream decoder is reset on every Attach, so
-// a frame decoded on the new connection is built exclusively from bytes
-// of that connection — bytes from a previous connection can never leak
-// into it. Message-level reassembly state, in contrast, deliberately
-// survives Attach, so an incomplete message can still be completed by
-// fragments arriving on the new transport.
+// Receive boundary rule: every Attach atomically (under rxMu) resets the
+// stream decoder AND advances the receive generation. A frame decoded on
+// the new connection is therefore built exclusively from bytes of that
+// connection:
+//   - bytes still buffered in the decoder are discarded by the reset;
+//   - bytes of the old connection that are read only AFTER the switch
+//     (the old read loop was blocked in Read, or its consume was still
+//     waiting for rxMu) carry the old generation and are dropped whole
+//     in consume — they never enter the new connection's decoder and can
+//     never combine with its bytes into a plausible-looking frame.
+//
+// Message-level reassembly state, in contrast, deliberately survives
+// Attach, so an incomplete message can still be completed by fragments
+// arriving on the new transport.
 func (s *Session) Attach(conn io.ReadWriteCloser) error {
+	// Lock order rxMu -> mu matches consume/handleControl. Holding both
+	// makes the transport swap and the receive-boundary reset one atomic
+	// step: no read loop can observe the new connection with the old
+	// decoder state, or the old generation with the new connection.
+	s.rxMu.Lock()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		s.rxMu.Unlock()
 		return ErrSessionClosed
 	}
 	old := s.conn
@@ -108,17 +129,16 @@ func (s *Session) Attach(conn io.ReadWriteCloser) error {
 	// Renegotiate on every new connection: fall back to defaults until the
 	// peer's hello arrives, then the advertised limits take effect at once.
 	s.peerCaps = DefaultPeerCaps()
+	s.rxGen++
+	s.decoder.Reset()
+	gen := s.rxGen
 	s.mu.Unlock()
+	s.rxMu.Unlock()
 	if old != nil {
 		old.Close()
 	}
-	// Establish the receive boundary for the new connection. rxMu
-	// serializes against a still-draining readLoop of the old transport.
-	s.rxMu.Lock()
-	s.decoder.Reset()
-	s.rxMu.Unlock()
 	s.wg.Add(2)
-	go s.readLoop(conn)
+	go s.readLoop(conn, gen)
 	go s.sendHello(conn)
 	return nil
 }
@@ -184,6 +204,9 @@ func (s *Session) SendMessage(payload []byte) (msgID uint32, err error) {
 	}
 	msgID = s.sendMsg
 	s.sendMsg++
+	if s.sendMsg == capsReservedMsgID {
+		s.sendMsg++ // 0xFFFFFFFF is reserved for control traffic
+	}
 	frames, nextSeq, err := Fragment(msgID, payload, s.sendSeq)
 	if err != nil {
 		s.mu.Unlock()
@@ -242,6 +265,7 @@ func (s *Session) Stats() Stats {
 		DuplicateFragments: dup,
 		FragmentTimeouts:   timeouts,
 		InFlightRejected:   inflightRej,
+		StaleBytesDropped:  s.staleBytesDropped,
 	}
 }
 
@@ -277,13 +301,15 @@ func (s *Session) Close() error {
 }
 
 // readLoop consumes the transport until it fails or the session closes.
-func (s *Session) readLoop(conn io.ReadWriteCloser) {
+// gen is the receive generation this loop belongs to; it is stamped on
+// every chunk handed to consume.
+func (s *Session) readLoop(conn io.ReadWriteCloser, gen uint64) {
 	defer s.wg.Done()
 	buf := make([]byte, 4096)
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
-			s.consume(buf[:n])
+			s.consume(gen, buf[:n])
 		}
 		if err != nil {
 			// Report only if this connection is still the active one;
@@ -305,9 +331,20 @@ func (s *Session) isCurrent(conn io.ReadWriteCloser) bool {
 }
 
 // consume feeds bytes through decoder, reassembler and dedup.
-func (s *Session) consume(data []byte) {
+//
+// Bytes stamped with a stale generation (read from a transport that a
+// later Attach has already replaced) are dropped whole, regardless of
+// when the read happened: they belong to the previous connection's byte
+// stream and must never be parsed as part of the new one. The drop is
+// counted in Stats.StaleBytesDropped. This is a byte-level boundary only
+// — message-level reassembly state is untouched and survives.
+func (s *Session) consume(gen uint64, data []byte) {
 	s.rxMu.Lock()
 	defer s.rxMu.Unlock()
+	if gen != s.rxGen {
+		s.staleBytesDropped += uint64(len(data))
+		return
+	}
 	frames, errs := s.decoder.Feed(data)
 	for _, err := range errs {
 		s.reportErr(err)
