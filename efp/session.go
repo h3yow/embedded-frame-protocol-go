@@ -25,12 +25,13 @@ type Session struct {
 	cfg SessionConfig
 
 	// tx state: guarded by mu.
-	mu       sync.Mutex
-	conn     io.ReadWriteCloser
-	closed   bool
-	sendSeq  uint32
-	sendMsg  uint32
-	peerCaps PeerCaps // receive limits advertised by the peer (or defaults)
+	mu          sync.Mutex
+	conn        io.ReadWriteCloser
+	closed      bool
+	sendSeq     uint32
+	sendMsg     uint32
+	peerCaps    PeerCaps // receive limits advertised by the peer (or defaults)
+	helloV1Sent bool     // per-connection: answered a legacy v1 hello already
 
 	// wrMu serializes writes to the transport (data frames and control
 	// frames) so bytes of one frame never interleave on the wire. It is
@@ -40,11 +41,12 @@ type Session struct {
 
 	// rx state: only touched by the read loop and the janitor,
 	// serialized by rxMu.
-	rxMu        sync.Mutex
-	decoder     *Decoder
-	reassembler *Reassembler
-	delivered   map[uint32]struct{}
-	delivOrder  []uint32 // FIFO ring of delivered MsgIDs, bounded by dedupWindow
+	rxMu         sync.Mutex
+	decoder      *Decoder
+	reassembler  *Reassembler
+	delivered    map[uint32]struct{}
+	delivOrder   []uint32 // FIFO ring of delivered MsgIDs, bounded by dedupWindow
+	staleConnBts uint64   // bytes dropped because they came from a replaced conn
 
 	delivCh chan ReassembledMessage
 	errCh   chan error
@@ -108,6 +110,7 @@ func (s *Session) Attach(conn io.ReadWriteCloser) error {
 	// Renegotiate on every new connection: fall back to defaults until the
 	// peer's hello arrives, then the advertised limits take effect at once.
 	s.peerCaps = DefaultPeerCaps()
+	s.helloV1Sent = false
 	s.mu.Unlock()
 	if old != nil {
 		old.Close()
@@ -119,15 +122,21 @@ func (s *Session) Attach(conn io.ReadWriteCloser) error {
 	s.rxMu.Unlock()
 	s.wg.Add(2)
 	go s.readLoop(conn)
-	go s.sendHello(conn)
+	go s.sendHello(conn, capsVersion)
 	return nil
 }
 
 // sendHello makes a best-effort announcement of our receive capabilities
-// on the new transport. It runs asynchronously because a write may block
-// on synchronous transports (net.Pipe) until the peer reads; a blocked
-// hello is abandoned when the transport is replaced or closed.
-func (s *Session) sendHello(conn io.ReadWriteCloser) {
+// on the given transport, stamped with the given protocol version. It
+// runs asynchronously because a write may block on synchronous transports
+// (net.Pipe) until the peer reads; a blocked hello is abandoned when the
+// transport is replaced or closed.
+//
+// Unsolicited hellos go out at capsVersion so legacy (pre-caps) receivers
+// reject them at decode time instead of delivering them to their
+// application; Version is used only to answer a peer that itself spoke a
+// Version hello (first caps release).
+func (s *Session) sendHello(conn io.ReadWriteCloser, version uint8) {
 	defer s.wg.Done()
 	s.mu.Lock()
 	if s.closed || s.conn != conn {
@@ -141,7 +150,7 @@ func (s *Session) sendHello(conn io.ReadWriteCloser) {
 		MaxInFlight:    s.cfg.Reassembly.MaxInFlight,
 	}
 	s.mu.Unlock()
-	f, err := encodeHello(seq, local)
+	f, err := encodeHello(seq, version, local)
 	if err != nil {
 		return
 	}
@@ -236,12 +245,14 @@ func (s *Session) Stats() Stats {
 	defer s.rxMu.Unlock()
 	dup, timeouts, inflightRej := s.reassembler.counters()
 	return Stats{
-		FramesDecoded:      uint64(s.decoder.FramesDecoded),
-		DecodeErrors:       uint64(s.decoder.Errors),
-		NoiseBytesSkipped:  uint64(s.decoder.BytesDropped),
-		DuplicateFragments: dup,
-		FragmentTimeouts:   timeouts,
-		InFlightRejected:   inflightRej,
+		FramesDecoded:         uint64(s.decoder.FramesDecoded),
+		DecodeErrors:          uint64(s.decoder.Errors),
+		NoiseBytesSkipped:     uint64(s.decoder.BytesDropped),
+		DuplicateFragments:    dup,
+		FragmentTimeouts:      timeouts,
+		InFlightRejected:      inflightRej,
+		StaleConnBytesDropped: s.staleConnBts,
+		PartialFrameBytes:     uint64(s.decoder.Buffered()),
 	}
 }
 
@@ -283,7 +294,7 @@ func (s *Session) readLoop(conn io.ReadWriteCloser) {
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
-			s.consume(buf[:n])
+			s.consume(conn, buf[:n])
 		}
 		if err != nil {
 			// Report only if this connection is still the active one;
@@ -305,16 +316,31 @@ func (s *Session) isCurrent(conn io.ReadWriteCloser) bool {
 }
 
 // consume feeds bytes through decoder, reassembler and dedup.
-func (s *Session) consume(data []byte) {
+//
+// Receive boundary for late bytes: the batch is accepted only if conn is
+// still the attached transport. Bytes read from a connection that Attach
+// has already replaced — no matter when the read returns relative to the
+// switch — are dropped whole and counted in Stats.StaleConnBytesDropped.
+// They never enter the decoder, so they can neither complete a buffered
+// partial frame nor concatenate with the new connection's bytes into a
+// frame that looks intact but is garbage. The check happens under rxMu,
+// which Attach also takes to reset the decoder, so "reset" and "drop"
+// are fully ordered: a batch from the old connection is either consumed
+// entirely before the reset (genuinely pre-switch) or dropped entirely.
+func (s *Session) consume(conn io.ReadWriteCloser, data []byte) {
 	s.rxMu.Lock()
 	defer s.rxMu.Unlock()
+	if !s.isCurrent(conn) {
+		s.staleConnBts += uint64(len(data))
+		return
+	}
 	frames, errs := s.decoder.Feed(data)
 	for _, err := range errs {
 		s.reportErr(err)
 	}
 	for _, f := range frames {
 		if f.Flags&FlagControl != 0 {
-			s.handleControl(f)
+			s.handleControl(conn, f)
 			continue
 		}
 		msg, err := s.reassembler.Push(f)
@@ -335,15 +361,30 @@ func (s *Session) consume(data []byte) {
 
 // handleControl applies a session-layer control frame. Called from
 // consume (rxMu held); takes mu only briefly (lock order: rxMu before mu).
-func (s *Session) handleControl(f *Frame) {
+//
+// A hello stamped with the legacy Version comes from a peer of the first
+// caps release, which only accepts Version frames: answer it with one
+// Version hello of our own (once per connection) so negotiation with
+// that release still completes. The reply is sent asynchronously because
+// a write may block and rxMu must never be held across a blocking write.
+func (s *Session) handleControl(conn io.ReadWriteCloser, f *Frame) {
 	caps, err := decodeHello(f.Payload)
 	if err != nil {
 		s.reportErr(err)
 		return
 	}
+	var replyV1 bool
 	s.mu.Lock()
 	s.peerCaps = caps
+	if f.Version == Version && !s.helloV1Sent {
+		s.helloV1Sent = true
+		replyV1 = true
+	}
 	s.mu.Unlock()
+	if replyV1 {
+		s.wg.Add(1)
+		go s.sendHello(conn, Version)
+	}
 }
 
 // janitor periodically expires stale reassemblies.

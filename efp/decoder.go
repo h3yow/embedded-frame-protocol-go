@@ -28,6 +28,10 @@ func NewDecoder() *Decoder { return &Decoder{} }
 // layer and is intentionally NOT reset (see Session.Attach).
 func (d *Decoder) Reset() { d.buf = d.buf[:0] }
 
+// Buffered returns the number of undecoded bytes currently held (a
+// partial frame waiting for the rest of its bytes).
+func (d *Decoder) Buffered() int { return len(d.buf) }
+
 // Feed appends data to the internal buffer and decodes as many complete
 // frames as possible. Corrupt bytes are skipped (resync) and reported via
 // the returned errors; undecodable trailing bytes (half packets) are kept
@@ -60,7 +64,7 @@ func (d *Decoder) Feed(data []byte) (frames []*Frame, errs []error) {
 			}
 		}
 		// Header present: validate version before trusting LEN.
-		if d.buf[2] != Version {
+		if !versionAccepted(d.buf[2], d.buf[3]) {
 			errs = append(errs, &FrameError{Kind: ErrKindUnsupportedVersion,
 				Detail: fmt.Sprintf("version=%d supported=%d", d.buf[2], Version)})
 			d.Errors++

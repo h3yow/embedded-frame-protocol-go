@@ -94,6 +94,22 @@ var (
 	ErrExceedsPeerLimit = errors.New("efp: message exceeds peer's receive limit")
 )
 
+// versionAccepted reports whether a frame carrying the given version and
+// flags may be decoded by this stack.
+//
+// Data frames ride at Version. Capability-negotiation control frames ride
+// at capsVersion (see caps.go): receivers from before the caps feature
+// only accept Version, so they reject a hello at decode time — the hello
+// can never surface in a legacy peer's application as a phantom short
+// message. A capsVersion frame without the control flag is rejected like
+// any other unsupported version.
+func versionAccepted(ver uint8, flags uint8) bool {
+	if ver == Version {
+		return true
+	}
+	return ver == capsVersion && flags&FlagControl != 0
+}
+
 // Frame is one decoded protocol frame.
 type Frame struct {
 	Version uint8
@@ -151,7 +167,7 @@ func DecodeFrame(buf []byte) (*Frame, error) {
 		return nil, &FrameError{Kind: ErrKindBadMagic,
 			Detail: fmt.Sprintf("magic=%02x %02x", buf[0], buf[1])}
 	}
-	if buf[2] != Version {
+	if !versionAccepted(buf[2], buf[3]) {
 		return nil, &FrameError{Kind: ErrKindUnsupportedVersion,
 			Detail: fmt.Sprintf("version=%d supported=%d", buf[2], Version)}
 	}

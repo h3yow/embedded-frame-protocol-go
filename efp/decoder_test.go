@@ -120,3 +120,46 @@ func TestDecoderGarbageOnlyStream(t *testing.T) {
 	}
 	t.Logf("garbage-only input: %v; decoder recovered with payload=%q", errs[0], frames[0].Payload)
 }
+
+// TestDecoderCapsVersionControlFrame: a control frame stamped with
+// capsVersion is accepted (so capability negotiation works), while a
+// non-control frame at capsVersion is rejected like any unsupported
+// version — and a legacy receiver's view (Version only) never sees the
+// hello as data.
+func TestDecoderCapsVersionControlFrame(t *testing.T) {
+	d := NewDecoder()
+	hello := mustEncode(t, &Frame{
+		Version: capsVersion, Flags: FlagControl, Seq: 0, FragCnt: 1,
+		Payload: []byte{1, 0, 0, 1, 0, 0, 8},
+	})
+	data := mustEncode(t, &Frame{Seq: 1, MsgID: 42, FragCnt: 1, Payload: []byte("v1 data")})
+
+	frames, errs := d.Feed(append(hello, data...))
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(frames) != 2 {
+		t.Fatalf("decoded %d frames, want 2 (hello + data)", len(frames))
+	}
+	if frames[0].Version != capsVersion || frames[0].Flags&FlagControl == 0 {
+		t.Fatalf("frame 0 = version %d flags %#x, want capsVersion control", frames[0].Version, frames[0].Flags)
+	}
+	if frames[1].Version != Version || string(frames[1].Payload) != "v1 data" {
+		t.Fatalf("frame 1 = version %d payload %q, want v1 data", frames[1].Version, frames[1].Payload)
+	}
+	t.Logf("capsVersion control frame accepted alongside v1 data: %+v / %q",
+		frames[0].Payload, frames[1].Payload)
+
+	// A capsVersion frame WITHOUT the control flag is not decodable.
+	d2 := NewDecoder()
+	bogus := mustEncode(t, &Frame{Seq: 2, MsgID: 43, FragCnt: 1, Payload: []byte("v2 data?")})
+	bogus[2] = capsVersion // re-stamp a plain data frame; CRC stays valid
+	frames, errs = d2.Feed(bogus)
+	if len(frames) != 0 {
+		t.Fatalf("capsVersion data frame decoded: %+v", frames)
+	}
+	if len(errs) == 0 || !errors.Is(errs[0], ErrUnsupportedVersion) {
+		t.Fatalf("capsVersion data frame: got errs=%v, want ErrUnsupportedVersion", errs)
+	}
+	t.Logf("capsVersion non-control frame rejected as unsupported version: %v", errs[0])
+}

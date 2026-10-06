@@ -17,14 +17,24 @@ import (
 //
 //	KIND(1)=1  MAX_MSG_SIZE(4)  MAX_IN_FLIGHT(2)
 //
-// Compatibility: a peer that never sends a hello (older firmware) is
-// handled by falling back to DefaultPeerCaps(); the connection works, and
-// locally enforced send limits still apply, so oversized messages fail at
-// send time instead of being silently dropped by the receiver.
+// Compatibility:
+//   - Peers from before the caps feature only accept Version frames and
+//     would deliver a Version hello to their application as a phantom
+//     7-byte message. Hellos are therefore sent at capsVersion, which
+//     such receivers reject at decode time (resync, like line noise) —
+//     their application never sees anything. Such a peer never sends a
+//     hello either, so the session falls back to DefaultPeerCaps(); the
+//     connection works, and locally enforced send limits still apply, so
+//     oversized messages fail at send time instead of being silently
+//     dropped by the receiver.
+//   - Peers from the first caps release send their hello at Version. A
+//     Version hello is answered with one Version hello of our own (once
+//     per connection), so negotiation with them still completes.
 const (
 	capsKindHello   = 1
 	capsHelloLen    = 7
 	capsMaxInFlight = 1 << 16 // advertised in-flight limit is a uint16
+	capsVersion     = 2       // hello frames ride at this protocol version
 )
 
 // PeerCaps describes what the peer is willing to receive.
@@ -42,8 +52,10 @@ func DefaultPeerCaps() PeerCaps {
 	return PeerCaps{MaxMessageSize: cfg.MaxMessageSize, MaxInFlight: cfg.MaxInFlight}
 }
 
-// encodeHello builds the control frame advertising the given local caps.
-func encodeHello(seq uint32, caps PeerCaps) (*Frame, error) {
+// encodeHello builds the control frame advertising the given local caps,
+// stamped with the given protocol version (capsVersion for unsolicited
+// hellos, Version when answering a legacy peer's Version hello).
+func encodeHello(seq uint32, version uint8, caps PeerCaps) (*Frame, error) {
 	if caps.MaxInFlight > capsMaxInFlight {
 		caps.MaxInFlight = capsMaxInFlight
 	}
@@ -52,7 +64,7 @@ func encodeHello(seq uint32, caps PeerCaps) (*Frame, error) {
 	binary.BigEndian.PutUint32(p[1:], uint32(caps.MaxMessageSize))
 	binary.BigEndian.PutUint16(p[5:], uint16(caps.MaxInFlight))
 	return &Frame{
-		Version: Version,
+		Version: version,
 		Flags:   FlagControl,
 		Seq:     seq,
 		MsgID:   0, // control frames carry no application message
